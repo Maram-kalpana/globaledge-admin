@@ -5,6 +5,7 @@ const { nowGmt } = require('../utils/datetime');
 const { withTransaction } = require('../utils/transaction');
 const { httpError } = require('../utils/httpError');
 const orderService = require('./orderService');
+const { ensureInvoiceNumber } = require('./invoiceService');
 
 const SORT = {
   date: 'p.date_added',
@@ -343,38 +344,33 @@ async function statsSummary(req) {
 
 async function list(req) {
   const { page, limit, offset, sortCol, dir, search } = parseList(req, SORT, 'date');
-  const status = req.query.status;
+  const status = req.query.status; // '0' | '1' | undefined
   const params = [];
-const {
-  dateFrom,
-  dateTo,
-} = getDateRangeFilters(req);
-/*
- * Admin Payments page:
- * show only successful Paytm payments.
- *
- * p.status:
- * 0 = pending/failed
- * 1 = success
- */
-let where = `
-  p.status = '1'
-  AND o.status IN (
-    'wc-processing',
-    'wc-completed'
-  )
-`;
-if (dateFrom && dateTo) {
-  where += `
-    AND p.date_added >= ?
-    AND p.date_added < DATE_ADD(?, INTERVAL 1 DAY)
-  `;
+  const {
+    dateFrom,
+    dateTo,
+  } = getDateRangeFilters(req);
 
-  params.push(
-    `${dateFrom} 00:00:00`,
-    dateTo
-  );
-}
+  /*
+   * Admin Payments page:
+   * show ALL Paytm payments (successful, pending, failed) by default.
+   * Optional ?status=0|1 lets the UI filter down to one bucket later.
+   */
+  let where = `1 = 1`;
+
+  if (status === '0' || status === '1') {
+    where += ` AND p.status = ?`;
+    params.push(status);
+  }
+
+  if (dateFrom && dateTo) {
+    where += `
+      AND p.date_added >= ?
+      AND p.date_added < DATE_ADD(?, INTERVAL 1 DAY)
+    `;
+    params.push(`${dateFrom} 00:00:00`, dateTo);
+  }
+
   if (search) {
     where += ` AND (
       p.paytm_order_id LIKE ? OR p.transaction_id LIKE ? OR o.billing_email LIKE ?
@@ -523,13 +519,18 @@ async function reconcile(orderId, body = {}) {
           `UPDATE ${P}wc_order_stats SET status = ? WHERE order_id = ?`,
           [nextStatus, targetOrderId]
         );
+
+        // Order just moved into a paid/fulfillable state — make sure an invoice number exists,
+        // same as WordPress/PDF Invoices plugin would generate on this status transition.
+        if (['processing', 'completed'].includes(nextStatus)) {
+          await ensureInvoiceNumber(targetOrderId, conn);
+        }
       }
     }
   });
 
   return getById(targetOrderId);
 }
-
 module.exports = { list, getById, getByOrderId, statsSummary, reconcile, parsePaytmResponse };
 
 

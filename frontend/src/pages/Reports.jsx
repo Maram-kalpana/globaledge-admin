@@ -16,7 +16,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { getCustomers } from '../api/customers';
 import {
   downloadReports,
@@ -30,6 +30,7 @@ import PageHeader from '../components/PageHeader';
 import { useSnackbar } from '../context/SnackbarContext';
 import useDebounce from '../hooks/useDebounce';
 import { formatCurrency, formatDate, fullName } from '../utils/format';
+import * as XLSX from 'xlsx';
 
 const RANGE_OPTIONS = [
   { value: 'today', label: 'Today' },
@@ -88,6 +89,7 @@ export default function Reports() {
     report_day: 'previous',
     timezone: 'Asia/Kolkata',
   });
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
     getCustomers({ limit: 500, sort: 'name', dir: 'asc' })
@@ -127,24 +129,102 @@ export default function Reports() {
     [range, selectDate, dateFrom, dateTo, customerIds.join(','), debouncedSearch]
   );
 
-  const load = useCallback(() => {
-    setState((s) => ({ ...s, loading: true, error: null }));
-    Promise.all([
-      getReports({ page: page + 1, limit, ...filterParams }),
+  const load = useCallback(async () => {
+  // Do not request an incomplete custom range.
+  if (range === 'custom' && (!dateFrom || !dateTo)) {
+    setState((s) => ({
+      ...s,
+      rows: [],
+      total: 0,
+      loading: false,
+      error: null,
+    }));
+
+    setSummary(null);
+    setRangeLabel('Custom date range');
+    return;
+  }
+
+  // Do not request an incomplete single-date range.
+  if (range === 'select_date' && !selectDate) {
+    setState((s) => ({
+      ...s,
+      rows: [],
+      total: 0,
+      loading: false,
+      error: null,
+    }));
+
+    setSummary(null);
+    setRangeLabel('Select date');
+    return;
+  }
+
+  // Every load gets a unique ID.
+  // Older responses are ignored if a newer request has started.
+  const requestId = ++requestIdRef.current;
+
+  setState((s) => ({
+    ...s,
+    loading: true,
+    error: null,
+  }));
+
+  try {
+    const [listRes, summaryRes] = await Promise.all([
+      getReports({
+        page: page + 1,
+        limit,
+        ...filterParams,
+      }),
+
       getReportSummary(filterParams),
-    ])
-      .then(([listRes, summaryRes]) => {
-        setState({
-          rows: listRes.data.data || [],
-          total: listRes.data.total || 0,
-          loading: false,
-          error: null,
-        });
-        setSummary(summaryRes.data);
-        setRangeLabel(listRes.data.range?.label || summaryRes.data.range?.label || '');
-      })
-      .catch((e) => setState((s) => ({ ...s, loading: false, error: e.message, rows: [] })));
-  }, [page, limit, filterParams]);
+    ]);
+
+    // Ignore stale/old API responses.
+    if (requestId !== requestIdRef.current) {
+      return;
+    }
+
+    setState({
+      rows: listRes.data.data || [],
+      total: listRes.data.total || 0,
+      loading: false,
+      error: null,
+    });
+
+    setSummary(summaryRes.data);
+
+    setRangeLabel(
+      listRes.data.range?.label ||
+      summaryRes.data.range?.label ||
+      ''
+    );
+  } catch (e) {
+    // Ignore errors from stale requests too.
+    if (requestId !== requestIdRef.current) {
+      return;
+    }
+
+    setState((s) => ({
+      ...s,
+      loading: false,
+      error: e.message,
+      rows: [],
+      total: 0,
+    }));
+
+    setSummary(null);
+  }
+}, [
+  page,
+  limit,
+  filterParams,
+  range,
+  selectDate,
+  dateFrom,
+  dateTo,
+]);
 
   useEffect(() => {
     setPage(0);
@@ -178,6 +258,51 @@ export default function Reports() {
         `${type === 'invoice' ? 'Invoices' : 'Packing slips'} downloaded (${countLabel})`,
         'success'
       );
+    } catch (e) {
+      showToast(e.message, 'error');
+    } finally {
+      setDownloading('');
+    }
+  };
+  const runExportExcel = async () => {
+    setDownloading('excel');
+    try {
+      // Fetch all rows matching the current filters
+      const { data } = await getReports({ page: 1, limit: 10000, ...filterParams });
+      let rows = data.data || [];
+  
+      // If specific orders are ticked, export only those
+      if (selectedOrders.size > 0) {
+        rows = rows.filter((r) => selectedOrders.has(r.order_id));
+      }
+  
+      if (!rows.length) {
+        showToast('No orders to export', 'error');
+        return;
+      }
+  
+      const sheetData = rows.map((r) => ({
+        'Order #': r.order_id,
+        Customer: r.customer_name || '—',
+        Email: r.billing_email || '—',
+        'Invoice #': r.invoice_number ?? '—',
+        'Packing Slip #': r.packing_slip_number ?? '—',
+        Total: r.total_amount,
+        'Order Date': formatDate(r.date_created_gmt),
+      }));
+  
+      const worksheet = XLSX.utils.json_to_sheet(sheetData);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Reports');
+  
+      const filename = `brassleaf-reports-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      XLSX.writeFile(workbook, filename);
+  
+      const label =
+        selectedOrders.size > 0
+          ? `${rows.length} selected order(s)`
+          : `${rows.length} order(s)`;
+      showToast(`Excel sheet downloaded (${label})`, 'success');
     } catch (e) {
       showToast(e.message, 'error');
     } finally {
@@ -348,6 +473,14 @@ export default function Reports() {
             >
               {downloading === 'packing-slip' ? 'Downloading…' : 'Download packing slips'}
             </Button>
+            <Button
+  variant="outlined"
+  startIcon={<DownloadIcon />}
+  disabled={Boolean(downloading)}
+  onClick={runExportExcel}
+>
+  {downloading === 'excel' ? 'Downloading…' : 'Download Excel'}
+</Button>
           </Stack>
         }
       />

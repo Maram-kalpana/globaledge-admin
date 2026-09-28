@@ -5,6 +5,7 @@ const { resolveDateRange, formatKolkataDate } = require('../utils/dateRange');
 const { unserializePhp } = require('../utils/php');
 const { httpError } = require('../utils/httpError');
 const orderService = require('./orderService');
+const { ensureInvoiceNumber } = require('./invoiceService');
 const PDFDocument = require('pdfkit');
 // const { htmlToPdfBuffer, toBuffer } = require('./pdfService');
 const { sendMail } = require('./mailService');
@@ -620,6 +621,23 @@ async function enrichOrder(order) {
     rate: t.rate_percent,
   }));
 
+  // Resolve invoice number, backfilling for orders reconciled before
+  // invoice generation was wired into the payment flow (e.g. legacy
+  // pending -> success transitions that bypassed WordPress hooks).
+  const eligibleForInvoice = ['wc-processing', 'wc-completed'].includes(order.status);
+  let invoiceNumber = metaMap._wcpdf_invoice_number || order.invoice_number || null;
+  let invoiceDate = metaMap._wcpdf_invoice_date_formatted || order.invoice_date || null;
+
+  if (!invoiceNumber && eligibleForInvoice) {
+    try {
+      const result = await ensureInvoiceNumber(order.id);
+      invoiceNumber = String(result.invoiceNumber);
+      invoiceDate = invoiceDate || result.invoiceDate || null;
+    } catch (e) {
+      console.error('Could not backfill invoice number for order', order.id, e.message);
+    }
+  }
+
   return {
     ...order,
     line_items: lineItems,
@@ -627,12 +645,8 @@ async function enrichOrder(order) {
     subtotal,
     shipping_cost: shippingCost,
     shipping_label: shippingLabel,
-    invoice_number:
-  metaMap._wcpdf_invoice_number ||
-  order.invoice_number ||
-  null,
-    // invoice_number: metaMap._wcpdf_invoice_number || order.invoice_number || order.id,
-    invoice_date: metaMap._wcpdf_invoice_date_formatted || order.invoice_date || order.date_created_gmt,
+    invoice_number: invoiceNumber,
+    invoice_date: invoiceDate || order.date_created_gmt,
     packing_slip_number: order.id,
     customer_name: order.billing
       ? [order.billing.first_name, order.billing.last_name].filter(Boolean).join(' ')
@@ -1770,9 +1784,48 @@ async function createCombinedPdfBuffer(
 
 function buildListQuery(req) {
   const { search } = parseList(req, SORT, 'date');
-  const customerIds = parseIdList(req.query.customer_ids || req.query.customer_id);
-  const orderIds = parseIdList(req.query.order_ids);
-  const range = resolveDateRange(req.query);
+
+  const query = req?.query || {};
+
+  const customerIds = parseIdList(
+    query.customer_ids || query.customer_id
+  );
+
+  const orderIds = parseIdList(
+    query.order_ids
+  );
+
+  // Normalize report date parameters before resolving the range.
+  // Supports both snake_case and camelCase without changing
+  // the existing frontend/API contract.
+  const dateQuery = {
+    ...query,
+
+    range:
+      query.range ||
+      query.date_range ||
+      'today',
+
+    date:
+      query.date ||
+      query.select_date ||
+      undefined,
+
+    date_from:
+      query.date_from ||
+      query.dateFrom ||
+      query.from ||
+      undefined,
+
+    date_to:
+      query.date_to ||
+      query.dateTo ||
+      query.to ||
+      undefined,
+  };
+
+  const range = resolveDateRange(dateQuery);
+
   const params = [];
   // let where = `o.type = 'shop_order'`;
   let where = `
@@ -1842,6 +1895,26 @@ async function list(req) {
     [...params, limit, offset]
   );
 
+  // Backfill invoice numbers for eligible orders missing one
+  // (e.g. orders reconciled to success before invoice generation
+  // was wired into the payment flow).
+  await Promise.all(
+    rows.map(async (r) => {
+      if (
+        r.invoice_number == null &&
+        ['wc-processing', 'wc-completed'].includes(r.status)
+      ) {
+        try {
+          const result = await ensureInvoiceNumber(r.order_id);
+          r.invoice_number = result.invoiceNumber;
+          r.invoice_date = r.invoice_date || result.invoiceDate || null;
+        } catch (e) {
+          console.error('Could not backfill invoice number for order', r.order_id, e.message);
+        }
+      }
+    })
+  );
+
   const data = rows.map((r) => ({
     id: r.order_id,
     order_id: r.order_id,
@@ -1864,7 +1937,6 @@ async function list(req) {
 
   return { ...listResponse(data, total, page, limit), range };
 }
-
 async function summary(req) {
   const { where, from, params, range } = buildListQuery(req);
   const [[row]] = await pool.query(
