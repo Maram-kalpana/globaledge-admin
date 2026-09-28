@@ -7,6 +7,7 @@ import {
   CardContent,
   FormControl,
   Grid,
+  Chip,
   InputLabel,
   MenuItem,
   Select,
@@ -105,6 +106,9 @@ function StatCard({ label, value, icon: Icon }) {
 }
 
 function ProductCard({ product }) {
+  const sizes = product.sizes || [];
+  const soldSizes = sizes.filter((s) => Number(s.units_sold) > 0);
+
   return (
     <Card variant="outlined" sx={{ height: '100%' }}>
       <CardContent>
@@ -128,7 +132,7 @@ function ProductCard({ product }) {
             </Box>
           </Stack>
 
-          <Stack direction="row" spacing={2}>
+          <Stack direction="row" spacing={2} alignItems="flex-end">
             <Box>
               <Typography variant="caption" color="text.secondary" display="block">
                 Units Sold
@@ -145,13 +149,56 @@ function ProductCard({ product }) {
                 {formatCurrency(product.sales_amount)}
               </Typography>
             </Box>
+            <Box>
+              <Typography variant="caption" color="text.secondary" display="block">
+                Available
+              </Typography>
+              <Typography variant="h6" fontWeight={700}>
+                {product.available_qty == null ? '—' : formatNumber(product.available_qty)}
+              </Typography>
+            </Box>
           </Stack>
+
+          {product.sold_out && (
+            <Chip size="small" color="error" label="Sold out" sx={{ alignSelf: 'flex-start' }} />
+          )}
+
+          {sizes.length > 0 && (
+            <Box>
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+                Sizes sold in this period
+              </Typography>
+              {soldSizes.length === 0 ? (
+                <Typography variant="body2" color="text.secondary">
+                  No sizes sold
+                </Typography>
+              ) : (
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
+                  {soldSizes.map((s) => (
+                    <Chip
+                      key={s.variation_id}
+                      size="small"
+                      variant={s.sold_out ? 'filled' : 'outlined'}
+                      color={s.sold_out ? 'error' : 'default'}
+                      label={
+                        `${s.size}: ${s.units_sold} sold` +
+                        (s.sold_out
+                          ? ' · Sold out'
+                          : s.available_qty != null
+                            ? ` · ${s.available_qty} left`
+                            : '')
+                      }
+                    />
+                  ))}
+                </Box>
+              )}
+            </Box>
+          )}
         </Stack>
       </CardContent>
     </Card>
   );
 }
-
 export default function Inventory() {
   const now = new Date();
   const { showToast } = useSnackbar();
